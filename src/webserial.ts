@@ -92,6 +92,9 @@ class Transport {
    * @param {string} message Message to format as trace line.
    */
   trace(message: string) {
+    if (!this.tracing) {
+      return;
+    }
     const delta = Date.now() - this.lastTraceTime;
     const prefix = `TRACE ${delta.toFixed(3)}`;
     const traceMessage = `${prefix} ${message}`;
@@ -166,10 +169,7 @@ class Transport {
 
     if (this.device.writable) {
       const writer = this.device.writable.getWriter();
-      if (this.tracing) {
-        console.log("Write bytes");
-        this.trace(`Write ${outData.length} bytes: ${this.hexConvert(outData)}`);
-      }
+      this.trace(`Write ${outData.length} bytes: ${this.hexConvert(outData)}`);
       await writer.write(outData);
       writer.releaseLock();
     }
@@ -380,10 +380,7 @@ class Transport {
       while (true) {
         const { value, done } = await this.reader.read();
         if (done || !value) break;
-        if (this.tracing) {
-          console.log("Raw Read bytes");
-          this.trace(`Read ${value.length} bytes: ${this.hexConvert(value)}`);
-        }
+        this.trace(`Read ${value.length} bytes: ${this.hexConvert(value)}`);
         yield value; // Yield each data chunk
       }
     } catch (error) {

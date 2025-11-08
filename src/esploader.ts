@@ -1272,7 +1272,6 @@ export class ESPLoader {
     this.info("Features: " + (await this.chip.getChipFeatures(this)));
     this.info("Crystal is " + (await this.chip.getCrystalFreq(this)) + "MHz");
     this.info("MAC: " + (await this.chip.readMac(this)));
-    await this.chip.readMac(this);
 
     if (typeof this.chip.postConnect != "undefined") {
       await this.chip.postConnect(this);
