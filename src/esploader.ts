@@ -118,12 +118,13 @@ export class ESPLoader {
   // Response code(s) sent by ROM
   ROM_INVALID_RECV_MSG = 0x05; // response if an invalid message is received
 
+  FLASH_SECTOR_SIZE = 0x1000;
   DEFAULT_TIMEOUT = 3000;
   ERASE_REGION_TIMEOUT_PER_MB = 30000;
   ERASE_WRITE_TIMEOUT_PER_MB = 40000;
   MD5_TIMEOUT_PER_MB = 8000;
   CHIP_ERASE_TIMEOUT = 120000;
-  FLASH_READ_TIMEOUT = 100000;
+  FLASH_READ_TIMEOUT = 3000;
   MAX_TIMEOUT = this.CHIP_ERASE_TIMEOUT * 2;
 
   SPI_ADDR_REG_MSB = true;
@@ -586,7 +587,7 @@ export class ESPLoader {
         This chip needs to be in download mode.`;
       if (downloadMode) {
         lastError = `Download mode successfully detected, but getting no sync reply:
-           The serial TX path seems to be down.`;
+            The serial TX path seems to be down.`;
       }
     }
 
@@ -1163,9 +1164,15 @@ export class ESPLoader {
    * @returns {Uint8Array} Flash read data
    */
   async readFlash(addr: number, size: number, onPacketReceived: FlashReadCallback = null) {
+    if (this.IS_STUB == false) {
+      throw new ESPError("Not Implemented In ROM");
+    }
+
+    const blockSize = this.FLASH_SECTOR_SIZE;
+    const maxInFlight = 64;
     let pkt = this._appendArray(this._intToByteArray(addr), this._intToByteArray(size));
-    pkt = this._appendArray(pkt, this._intToByteArray(0x1000));
-    pkt = this._appendArray(pkt, this._intToByteArray(1024));
+    pkt = this._appendArray(pkt, this._intToByteArray(blockSize));
+    pkt = this._appendArray(pkt, this._intToByteArray(maxInFlight));
 
     const res = await this.checkCommand("read flash", this.ESP_READ_FLASH, pkt);
 
@@ -1175,21 +1182,37 @@ export class ESPLoader {
 
     let resp = new Uint8Array(0);
     while (resp.length < size) {
-      const { value: packet } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
+        console.log("READ NEXT");
+        const { value: packet } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
+        console.log("READ ["+size+"]["+resp.length+"]["+packet.length+"]["+this.toHex(packet)+"]");
 
-      if (packet instanceof Uint8Array) {
-        if (packet.length > 0) {
-          resp = this._appendArray(resp, packet);
-          await this.transport.write(this._intToByteArray(resp.length));
+        if (packet instanceof Uint8Array) {
+          if (packet.length > 0) {
+            resp = this._appendArray(resp, packet);
 
-          if (onPacketReceived) {
-            onPacketReceived(packet, resp.length, size);
+            if (onPacketReceived) {
+              onPacketReceived(packet, resp.length, size);
+            }
           }
+        } else {
+          throw new ESPError("Failed to read flash: " + packet);
         }
-      } else {
-        throw new ESPError("Failed to read memory: " + packet);
-      }
+
+        // Send ACK if we received all data or Max In Flight count is reached
+        await this.transport.write(this._intToByteArray(resp.length));
+        console.log("ACK ["+resp.length+"]");
     }
+    const { value: md5sum } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
+    console.log("MD5 ["+this.toHex(md5sum)+"]");
+
+    // let md5flash = await this.flashMd5sum(addr, size);
+    // this.info("Calc  md5: " + this.toHex(md5sum));
+    // this.info("Flash md5: " + md5flash);
+    // if (md5flash != this.toHex(md5sum)) {
+    //   throw new ESPError("MD5 of file does not match data in flash!");
+    // } else {
+    //   this.info("Hash of data verified.");
+    // }
 
     return resp;
   }
@@ -1590,6 +1613,56 @@ export class ESPLoader {
       } else {
         await this.flashFinish();
       }
+    }
+  }
+
+/**
+   * Start monitoring the console output from the device.
+   * @param {number} baudrate - Baudrate for console monitoring
+   * @param {Function} onData - Optional callback function to handle received data
+   * @returns {Promise<void>}
+   */
+  async startConsoleMonitoring(baudrate = 115200, onData?: (data: Uint8Array) => void): Promise<void> {
+    try {
+      await this.transport.disconnect();
+      await this.transport.connect(baudrate, this.serialOptions);
+
+      this.info(`Console monitoring started at ${baudrate} baud`);
+
+      let isMonitoring = true;
+      while (isMonitoring) {
+        const readLoop = this.transport.rawRead();
+        const { value, done } = await readLoop.next();
+
+        if (done || !value) {
+          isMonitoring = false;
+        } else {
+          if (this.terminal) {
+            // Write raw Uint8Array to terminal to preserve ANSI escape codes
+            this.terminal.write(this.ui8ToBstr(value));
+          }
+          if (onData) {
+            onData(value);
+          }
+        }
+      }
+    } catch (error) {
+      this.error(`Console monitoring error: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Stop console monitoring and disconnect.
+   * @returns {Promise<void>}
+   */
+  async stopConsoleMonitoring(): Promise<void> {
+    try {
+      await this.transport.disconnect();
+      await this.transport.waitForUnlock(1500);
+      this.info("Console monitoring stopped");
+    } catch (error) {
+      this.error(`Error stopping console monitoring: ${error}`);
     }
   }
 
