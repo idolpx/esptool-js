@@ -1,5 +1,6 @@
-import { ESPError } from "./types/error.js";
+import md5 from "md5";
 import { Data, deflate, Inflate } from "pako";
+import { ESPError } from "./types/error.js";
 import { Transport, SerialOptions } from "./webserial.js";
 import { ROM } from "./targets/rom.js";
 import { ClassicReset, CustomReset, HardReset, ResetConstructors, ResetStrategy, UsbJtagSerialReset } from "./reset.js";
@@ -1168,13 +1169,14 @@ export class ESPLoader {
       throw new ESPError("Not Implemented In ROM");
     }
 
-    const blockSize = this.FLASH_SECTOR_SIZE;
+    const blockSize = this.FLASH_SECTOR_SIZE; // (size < this.FLASH_SECTOR_SIZE) ? size : this.FLASH_SECTOR_SIZE;
     const maxInFlight = 64;
     let pkt = this._appendArray(this._intToByteArray(addr), this._intToByteArray(size));
     pkt = this._appendArray(pkt, this._intToByteArray(blockSize));
     pkt = this._appendArray(pkt, this._intToByteArray(maxInFlight));
 
     const res = await this.checkCommand("read flash", this.ESP_READ_FLASH, pkt);
+    console.log("READ FLASH ["+addr+"]["+size+"]["+blockSize+"]["+maxInFlight+"]");
 
     if (res != 0) {
       throw new ESPError("Failed to read memory: " + res);
@@ -1182,37 +1184,40 @@ export class ESPLoader {
 
     let resp = new Uint8Array(0);
     while (resp.length < size) {
-        console.log("READ NEXT");
+        console.log("READ PACKET");
         const { value: packet } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
         console.log("READ ["+size+"]["+resp.length+"]["+packet.length+"]["+this.toHex(packet)+"]");
 
         if (packet instanceof Uint8Array) {
-          if (packet.length > 0) {
-            resp = this._appendArray(resp, packet);
 
-            if (onPacketReceived) {
-              onPacketReceived(packet, resp.length, size);
-            }
+          resp = this._appendArray(resp, packet);
+          if (resp.length < size && packet.length < blockSize) {
+            throw new ESPError("Corrupt data, expected " + blockSize + " bytes, got " + packet.length);
           }
-        } else {
-          throw new ESPError("Failed to read flash: " + packet);
+
+          // Send ACK if we received all data or Max In Flight count is reached
+          await this.transport.write(this._intToByteArray(resp.length));
+          console.log("ACK ["+resp.length+"]");
+
+          // Call callback
+          if (onPacketReceived) {
+            onPacketReceived(packet, resp.length, size);
+          }
+
         }
-
-        // Send ACK if we received all data or Max In Flight count is reached
-        await this.transport.write(this._intToByteArray(resp.length));
-        console.log("ACK ["+resp.length+"]");
     }
-    const { value: md5sum } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
-    console.log("MD5 ["+this.toHex(md5sum)+"]");
+    const { value } = await this.transport.read(this.FLASH_READ_TIMEOUT).next();
+    const md5flash = this.toHex(value)
+    console.log("MD5 ["+md5flash+"]");
 
-    // let md5flash = await this.flashMd5sum(addr, size);
-    // this.info("Calc  md5: " + this.toHex(md5sum));
-    // this.info("Flash md5: " + md5flash);
-    // if (md5flash != this.toHex(md5sum)) {
-    //   throw new ESPError("MD5 of file does not match data in flash!");
-    // } else {
-    //   this.info("Hash of data verified.");
-    // }
+    const md5sum = md5(resp);
+    this.debug("Calc  md5: " + md5sum);
+    this.debug("Flash md5: " + md5flash);
+    if (md5sum != md5flash) {
+      throw new ESPError("MD5 of file does not match data in flash!");
+    } else {
+      this.debug("Hash of data verified.");
+    }
 
     return resp;
   }
@@ -1495,28 +1500,38 @@ export class ESPLoader {
     if (this.IS_STUB === true && options.eraseAll === true) {
       await this.eraseFlash();
     }
-    let image: string, address: number;
+    let part: string, image: string, address: number;
     for (let i = 0; i < options.fileArray.length; i++) {
-      this.debug("Data Length " + options.fileArray[i].data.length);
+      part = options.fileArray[i].part.toUpperCase();
       image = options.fileArray[i].data;
+      address = options.fileArray[i].address;
+
+      image = this.ui8ToBstr(padTo(this.bstrToUi8(image), 4));
+      image = await this._updateImageFlashParams(image, address, options.flashMode, options.flashFreq);
+      if (options.reportProgress) options.reportProgress(i, 0, image.length);
+
+      // Check length
       this.debug("Image Length " + image.length);
       if (image.length === 0) {
         this.debug("Warning: File is empty");
         continue;
       }
-      image = this.ui8ToBstr(padTo(this.bstrToUi8(image), 4));
 
-      address = options.fileArray[i].address;
-
-      image = await this._updateImageFlashParams(image, address, options.flashMode, options.flashFreq);
-      let calcmd5: string | null = null;
-      if (options.calculateMD5Hash) {
-        calcmd5 = options.calculateMD5Hash(image);
-        this.debug("Image MD5 " + calcmd5);
+      // Check MD5
+      const calcmd5: string | null = md5(Uint8Array.from(image.split("").map(x => x.charCodeAt(0))));
+      this.debug("Image MD5 " + calcmd5);
+      const flashmd5 = await this.flashMd5sum(address, image.length);
+      this.debug("Flash MD5 " + flashmd5);
+      if (calcmd5 === flashmd5) {
+        this.info(`Image and Flash MD5 match for '${part}'. No need to write. Skipping...`);
+        if (options.reportProgress) options.reportProgress(i, image.length, image.length);
+        continue;
       }
+
       const uncsize = image.length;
       let blocks: number;
       if (options.compress) {
+        // Compress image
         const uncimage = this.bstrToUi8(image);
         image = this.ui8ToBstr(deflate(uncimage, { level: 9 }));
         blocks = await this.flashDeflBegin(uncsize, image.length, address);
@@ -1562,6 +1577,7 @@ export class ESPLoader {
             // ROM code writes block to flash before ACKing
             timeout = blockTimeout;
           }
+          // Write block to flash
           await this.flashDeflBlock(block, seq, timeout);
           if (this.IS_STUB) {
             // Stub ACKs when block is received, then writes to flash while receiving the block after it
@@ -1571,7 +1587,7 @@ export class ESPLoader {
           throw new ESPError("Yet to handle Non Compressed writes");
         }
         bytesSent += block.length;
-        image = image.slice(this.FLASH_WRITE_SIZE, image.length);
+        image = image.slice(this.FLASH_WRITE_SIZE);
         seq++;
         if (options.reportProgress) options.reportProgress(i, bytesSent, totalBytes);
       }
