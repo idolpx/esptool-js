@@ -7,9 +7,9 @@ import { FlashFreqValues, FlashModeValues } from "./arguments";
 export interface FlashOptions {
   /**
    * An array of file objects representing the data to be flashed.
-   * @type {Array<{ data: string; address: number }>}
+   * @type {Array<{ part: string; data: string; address: number }>}
    */
-  fileArray: { data: string; address: number }[];
+  fileArray: { part: string; data: string; address: number }[];
 
   /**
    * The flash mode to be used (e.g., QIO, QOUT, DIO, DOUT).
