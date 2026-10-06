@@ -458,7 +458,11 @@ class Transport {
       await this.reader?.cancel();
     }
     await this.waitForUnlock(400);
-    await this.device.close();
+    try {
+      await this.device.close();
+    } catch (error) {
+      console.error("Error closing serial port:", error);
+    }
     this.reader = undefined;
   }
 }

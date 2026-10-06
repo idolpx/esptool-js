@@ -1192,7 +1192,8 @@ export class ESPLoader {
 
           resp = this._appendArray(resp, packet);
           if (resp.length < size && packet.length < blockSize) {
-            throw new ESPError("Corrupt data, expected " + blockSize + " bytes, got " + packet.length);
+            const expected = (size < blockSize) ? size : blockSize;
+            throw new ESPError("Corrupt data, expected " + expected + " bytes, got " + packet.length);
           }
 
           // Send ACK if we received all data or Max In Flight count is reached
